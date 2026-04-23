@@ -16,7 +16,7 @@ pub fn run() {
         .setup(|app| {
             let shell = app.shell();
             let (mut rx, _child) = shell
-                .sidecar("api")
+                .sidecar("fastapi-backend")
                 .expect("failed to setup sidecar")
                 .spawn()
                 .expect("failed to spawn sidecar");

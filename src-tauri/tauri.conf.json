@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "tauri-app",
+  "productName": "HearMeOut",
   "version": "0.1.0",
-  "identifier": "com.yashk.tauri-app",
+  "identifier": "com.yashk.hearmeout",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "tauri-app",
+        "title": "Hear Me Out",
         "width": 800,
         "height": 600
       }
@@ -32,7 +32,7 @@
       "icons/icon.ico"
     ],
     "externalBin": [
-      "api"
+      "fastapi-backend"
     ]
   }
 }

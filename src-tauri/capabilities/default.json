@@ -11,7 +11,7 @@
         {
           "args": [],
           "sidecar": true,
-          "name": "api"
+          "name": "fastapi-backend"
         }
       ]
     }

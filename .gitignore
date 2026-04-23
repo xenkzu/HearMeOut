@@ -24,11 +24,11 @@ __pycache__/
 venv/
 .venv/
 build/
+fastapi-backend.spec
 api.spec
 
 # Tauri Sidecars (Do not leak binaries)
 src-tauri/*.exe
-src-tauri/binaries/*.exe
 src-tauri/binaries/
 
 # Editor directories and files
