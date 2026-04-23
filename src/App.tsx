@@ -9,8 +9,10 @@ function App() {
     try {
       const response = await fetch("http://127.0.0.1:8765/health");
       if (response.ok) {
+        console.log("Health check success");
         setStatus("connected");
       } else {
+        console.warn("Health check returned non-OK status:", response.status);
         setStatus("failed");
       }
     } catch (err) {
