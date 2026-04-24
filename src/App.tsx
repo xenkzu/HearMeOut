@@ -81,10 +81,19 @@ function App() {
       setPingCount(prev => prev + 1);
     }, 2000);
     
+    // Poll system info if not yet detected
+    let systemInfoInterval: number | undefined;
+    if (status === "connected" && (!systemInfo || systemInfo.device === "detecting")) {
+      systemInfoInterval = window.setInterval(fetchSystemInfo, 3000);
+    }
+    
     checkHealth();
     
-    return () => clearInterval(healthInterval);
-  }, [systemInfo]);
+    return () => {
+      clearInterval(healthInterval);
+      if (systemInfoInterval) clearInterval(systemInfoInterval);
+    };
+  }, [status, systemInfo]);
 
   useEffect(() => {
     let downloadInterval: number | undefined;
