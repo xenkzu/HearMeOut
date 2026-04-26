@@ -1,7 +1,14 @@
-# Tauri + React + Typescript
+# HearMeOut
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+A high-performance audio separation and analysis tool, now served entirely via a lightweight FastAPI backend and a React frontend.
 
-## Recommended IDE Setup
+## Installation
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+```bash
+git clone https://github.com/xenkzu/hearmeout
+cd hearmeout
+pip install -r requirements.txt
+python run.py
+```
+
+That's it! The frontend will be built automatically on the first run, and the app will open in your default browser.

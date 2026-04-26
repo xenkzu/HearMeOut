@@ -1,4 +1,7 @@
-onnxruntime-gpu
+torchaudio
+msaf
+mir_eval
+aiofiles
 fastapi
 uvicorn
 librosa
@@ -8,3 +11,5 @@ numpy
 requests
 python-multipart
 sse-starlette
+basic-pitch
+resampy

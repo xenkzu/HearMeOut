@@ -7,48 +7,40 @@ import requests
 import asyncio
 import json
 import numpy as np
-import librosa
 import soundfile as sf
+import aiofiles
+import torch
+import torchaudio
+import torchaudio.transforms as T
 import logging
+import librosa
+import numpy as np
+import scipy
+# Monkeypatch scipy.inf for msaf compatibility (scipy 1.11+ removed it)
+if not hasattr(scipy, "inf"):
+    scipy.inf = np.inf
+# Monkeypatch scipy.signal.gaussian for msaf compatibility
+import scipy.signal
+if not hasattr(scipy.signal, "gaussian"):
+    from scipy.signal import windows
+    scipy.signal.gaussian = windows.gaussian
+import msaf
 logging.basicConfig(level=logging.INFO, force=True)
 from pathlib import Path
 from typing import Dict, List, Optional
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+import webbrowser
 from sse_starlette.sse import EventSourceResponse
 
-# --- DLL Search Path for CUDA ---
-# Must happen before `import onnxruntime` so the CUDA provider DLL can find all its deps.
-site_packages = Path(os.getenv("LOCALAPPDATA", "")) / "Packages/PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0/LocalCache/local-packages/Python311/site-packages"
-if site_packages.exists():
-    # ORT capi dir must be on PATH so cuDNN split-libs (cudnn_ops_infer64_8.dll etc.) are found at runtime
-    ort_capi = site_packages / "onnxruntime/capi"
-    if ort_capi.exists():
-        try:
-            os.add_dll_directory(str(ort_capi))
-            os.environ["PATH"] = str(ort_capi) + os.pathsep + os.environ.get("PATH", "")
-        except:
-            pass
-    # Add all NVIDIA library bin dirs
-    nvidia_base = site_packages / "nvidia"
-    if nvidia_base.exists():
-        for bin_dir in nvidia_base.glob("**/bin"):
-            try:
-                os.add_dll_directory(str(bin_dir))
-                os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
-            except:
-                pass
-    # Fallback: torch/lib if present
-    torch_lib = site_packages / "torch/lib"
-    if torch_lib.exists():
-        try:
-            os.add_dll_directory(str(torch_lib))
-            os.environ["PATH"] = str(torch_lib) + os.pathsep + os.environ.get("PATH", "")
-        except:
-            pass
+# Phase 4 Imports
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+import scipy.stats
+# We'll import basic_pitch and other libs later to avoid startup overhead if possible
+# but for now let's just add the structure.
 
-# Import ORT after DLL paths are configured
-import onnxruntime as ort
+# Site packages path removed as we no longer use direct ONNX runtime DLL injection for this stage.
 
 # --- Configuration ---
 APP_NAME = "hearmeout"
@@ -68,11 +60,14 @@ for d in [MODEL_DIR, UPLOAD_DIR, OUTPUT_DIR]:
 # --- Global State ---
 class GlobalState:
     def __init__(self):
-        self.session: Optional[ort.InferenceSession] = None
-        self.provider = "CPUExecutionProvider"
+        self.demucs_model = None           # PyTorch demucs model
+        self.demucs_sources: List[str] = []
+        self.torch_device = "cpu"
+        self.provider = "CPU"
         self.download_progress = {"status": "idle", "progress": 0, "total": 0, "error": None}
         self.jobs: Dict[str, dict] = {}
         self.lock = threading.Lock()
+        self.chord_templates = None
 
 state = GlobalState()
 
@@ -80,28 +75,197 @@ app = FastAPI(title="HearMeOut ONNX Backend")
 
 # --- Helper Functions ---
 
-def detect_provider():
-    available = ort.get_available_providers()
-    if "CUDAExecutionProvider" in available:
-        return "CUDAExecutionProvider"
-    return "CPUExecutionProvider"
+def cleanup_job(job_id: str):
+    """Removes job files to prevent disk bloat on failure."""
+    job_dir = OUTPUT_DIR / job_id
+    if job_dir.exists():
+        shutil.rmtree(job_dir)
+    logging.info(f"Cleaned up failed job {job_id}")
+
+def init_chord_templates(device):
+    """Initializes chord templates on the specified device."""
+    if state.chord_templates is not None:
+        return
+    templates = []
+    # Major: 0, 4, 7
+    for i in range(12):
+        t = torch.zeros(12).to(device)
+        t[i] = 1.0
+        t[(i + 4) % 12] = 1.0
+        t[(i + 7) % 12] = 1.0
+        templates.append(t)
+    # Minor: 0, 3, 7
+    for i in range(12):
+        t = torch.zeros(12).to(device)
+        t[i] = 1.0
+        t[(i + 3) % 12] = 1.0
+        t[(i + 7) % 12] = 1.0
+        templates.append(t)
+    state.chord_templates = torch.stack(templates)
 
 def load_session():
-    model_path = MODEL_DIR / MODEL_NAME
-    if not model_path.exists():
-        return False
-    
+    """Load the PyTorch Demucs model for separation (ONNX kept for future use)."""
+    if state.demucs_model is not None:
+        return True
     try:
-        # Let ONNX Runtime handle fallback automatically
-        logging.info(f"Available ORT providers: {ort.get_available_providers()}")
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        state.session = ort.InferenceSession(str(model_path), providers=providers)
-        state.provider = state.session.get_providers()[0] # Get what was actually used
-        logging.info(f"Active provider: {state.provider}")
+        import torch
+        import demucs.pretrained
+        import demucs.apply
+        logging.info("Loading htdemucs_6s PyTorch model...")
+        bag = demucs.pretrained.get_model("htdemucs_6s")
+        model = bag.models[0] if hasattr(bag, "models") else bag
+        model.eval()
+
+        # Use GPU if available
+        if torch.cuda.is_available():
+            state.torch_device = "cuda"
+            state.provider = "CUDA"
+            model = model.to("cuda")
+            init_chord_templates("cuda")
+            logging.info(f"Demucs running on {torch.cuda.get_device_name(0)}")
+        else:
+            state.torch_device = "cpu"
+            state.provider = "CPU"
+            init_chord_templates("cpu")
+            logging.info("Demucs running on CPU")
+
+        state.demucs_model = model
+        state.demucs_sources = list(model.sources)
+        logging.info(f"Demucs sources: {state.demucs_sources}")
         return True
     except Exception as e:
-        print(f"Error loading ONNX session: {e}")
+        logging.error(f"Error loading Demucs model: {e}")
+        import traceback; traceback.print_exc()
         return False
+
+def estimate_key(chroma_sum):
+    """Estimates the musical key given a 12-element chroma sum vector."""
+    major_profile = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
+    minor_profile = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+    
+    # Ensure chroma_sum is a numpy array for correlation calc
+    if isinstance(chroma_sum, torch.Tensor):
+        chroma_sum = chroma_sum.cpu().numpy()
+        
+    best_key = ""
+    max_corr = -1
+    notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    for i in range(12):
+        major_rot = np.roll(major_profile, i)
+        minor_rot = np.roll(minor_profile, i)
+        corr_major = np.corrcoef(chroma_sum, major_rot)[0, 1]
+        corr_minor = np.corrcoef(chroma_sum, minor_rot)[0, 1]
+        if corr_major > max_corr:
+            max_corr = corr_major
+            best_key = f"{notes[i]} major"
+        if corr_minor > max_corr:
+            max_corr = corr_minor
+            best_key = f"{notes[i]} minor"
+    return best_key
+
+def detect_chords(chroma_gpu, sr):
+    """GPU-accelerated chord detection using template matching."""
+    try:
+        if state.chord_templates is None:
+            init_chord_templates(chroma_gpu.device)
+            
+        templates = state.chord_templates.to(chroma_gpu.device)
+        
+        # 2. Calculate Similarity (Cosine Similarity)
+        chroma_norm = torch.nn.functional.normalize(chroma_gpu, dim=0) # (12, time)
+        templates_norm = torch.nn.functional.normalize(templates, dim=1) # (24, 12)
+        scores = torch.matmul(templates_norm, chroma_norm) # (24, time)
+        
+        # 3. Smoothing (Simple Average Pooling over time)
+        scores_smooth = torch.nn.functional.avg_pool1d(scores.unsqueeze(0), 21, stride=1, padding=10)[0]
+        
+        # 4. Get Best Chord
+        best_chord_idx = torch.argmax(scores_smooth, dim=0).cpu().numpy()
+        notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+        chord_labels = [f"{notes[i % 12]}" for i in range(12)] + [f"{notes[i % 12]}m" for i in range(12)]
+        
+        # 5. Group into intervals
+        hop_time = 1024 / sr
+        chords_data = []
+        if len(best_chord_idx) == 0: return []
+            
+        current_chord = chord_labels[best_chord_idx[0]]
+        start_time = 0.0
+        
+        for i in range(1, len(best_chord_idx)):
+            chord = chord_labels[best_chord_idx[i]]
+            if chord != current_chord:
+                end_time = i * hop_time
+                if end_time - start_time > 0.1:
+                    chords_data.append({
+                        "chord": current_chord,
+                        "start": round(float(start_time), 2),
+                        "end": round(float(end_time), 2)
+                    })
+                current_chord = chord
+                start_time = end_time
+                
+        chords_data.append({
+            "chord": current_chord,
+            "start": round(float(start_time), 2),
+            "end": round(float(len(best_chord_idx) * hop_time), 2)
+        })
+        return chords_data
+    except Exception as e:
+        logging.error(f"Chord detection failed: {e}")
+        return []
+
+def get_sections(file_path):
+    """MSAF-based song segmentation using Foote algorithm."""
+    try:
+        # MSAF process returns (boundaries, labels)
+        # We use Foote algorithm for boundaries
+        boundaries, _ = msaf.process(str(file_path), boundaries_id="foote", labels_id=None)
+        
+        intervals = []
+        for i in range(len(boundaries)-1):
+            intervals.append((boundaries[i], boundaries[i+1]))
+            
+        if not intervals:
+            return [{"label": "full", "start": 0, "end": 0}]
+
+        durations = [e - s for s, e in intervals]
+        median_dur = np.median(durations)
+        
+        sections = []
+        for i, (start, end) in enumerate(intervals):
+            dur = end - start
+            if i == 0:
+                label = "intro"
+            elif i == len(intervals) - 1 and dur < median_dur:
+                label = "outro"
+            else:
+                # Heuristic: long = chorus, short = verse
+                label = "chorus" if dur >= median_dur else "verse"
+                
+            sections.append({
+                "label": label,
+                "start": round(float(start), 2),
+                "end": round(float(end), 2)
+            })
+        return sections
+    except Exception as e:
+        logging.warning(f"MSAF segmentation failed: {e}. Falling back to single section.")
+        # Fallback to full duration
+        waveform, sr = torchaudio.load(file_path)
+        duration = waveform.shape[-1] / sr
+        return [{"label": "full", "start": 0, "end": round(float(duration), 2)}]
+
+def ensure_vocals_stem(job_id, input_path):
+    job_output_dir = OUTPUT_DIR / job_id
+    vocals_path = job_output_dir / "vocals.wav"
+    if vocals_path.exists():
+        return str(vocals_path)
+    logging.info(f"Vocals stem missing for job {job_id}, running separation...")
+    separate_audio_task(job_id, input_path)
+    if vocals_path.exists():
+        return str(vocals_path)
+    raise Exception("Failed to generate vocals stem for analysis.")
 
 async def download_model_task():
     model_path = MODEL_DIR / MODEL_NAME
@@ -135,76 +299,297 @@ async def download_model_task():
             state.download_progress = {"status": "error", "progress": 0, "total": 0, "error": str(e)}
 
 def separate_audio_task(job_id: str, input_path: str):
+    """Heavy GPU task: Separates audio into 6 stems."""
     try:
-        if state.session is None:
+        if state.demucs_model is None:
             if not load_session():
-                raise Exception("Model not loaded and file missing.")
+                raise Exception("Failed to load Demucs model.")
 
-        state.jobs[job_id]["status"] = "processing"
-        
+        import torch
+        import demucs.apply
+
+        with state.lock:
+            state.jobs[job_id]["status"] = "separating"
+
         # 1. Load Audio
-        audio, sr = librosa.load(input_path, sr=44100, mono=False)
-        if audio.ndim == 1:
-            audio = np.stack([audio, audio])
-        elif audio.shape[0] > 2:
-            audio = audio[:2]
+        audio_tensor, sr = torchaudio.load(input_path)
+        if sr != 44100:
+            audio_tensor = T.Resample(sr, 44100)(audio_tensor)
+            sr = 44100
             
-        # Model's fixed sequence length
-        SEGMENT_LEN = 343980 
-        total_samples = audio.shape[1]
-        
-        # 2. Chunk and Process
-        # We'll process in segments of SEGMENT_LEN
-        all_stems = [] # List to store results for each chunk
-        
-        for i in range(0, total_samples, SEGMENT_LEN):
-            chunk = audio[:, i:i+SEGMENT_LEN]
-            actual_len = chunk.shape[1]
-            
-            # Pad if last chunk is too short
-            if actual_len < SEGMENT_LEN:
-                chunk = np.pad(chunk, ((0, 0), (0, SEGMENT_LEN - actual_len)))
-            
-            # Add batch dim: [1, 2, SEGMENT_LEN]
-            mix = chunk[np.newaxis, :].astype(np.float32)
-            
-            # Run ONNX Inference
-            inputs = {state.session.get_inputs()[0].name: mix}
-            outputs = state.session.run(None, inputs)
-            stems_chunk = outputs[0] # [1, 6, 2, SEGMENT_LEN]
-            
-            # Remove padding from the result of the last chunk
-            if actual_len < SEGMENT_LEN:
-                stems_chunk = stems_chunk[:, :, :, :actual_len]
-                
-            all_stems.append(stems_chunk)
-        
-        # 3. Stitch and Save
-        # Concatenate along the sample dimension (axis 3)
-        # Result shape: [1, 6, 2, total_samples]
-        full_stems = np.concatenate(all_stems, axis=3)
-        
+        if audio_tensor.shape[0] == 1:
+            audio_tensor = torch.cat([audio_tensor, audio_tensor], dim=0)
+        elif audio_tensor.shape[0] > 2:
+            audio_tensor = audio_tensor[:2]
+
+        mix = audio_tensor.unsqueeze(0)
+        if state.torch_device == "cuda":
+            mix = mix.cuda()
+
+        logging.info(f"Running Demucs separation on {state.torch_device}...")
+        with torch.no_grad():
+            sources = demucs.apply.apply_model(
+                state.demucs_model,
+                mix,
+                device=state.torch_device,
+                progress=True,
+                num_workers=1,
+            )
+
+        sources_np = sources.cpu().numpy()
+
         job_output_dir = OUTPUT_DIR / job_id
         job_output_dir.mkdir(exist_ok=True)
-        
-        stem_names = ["drums", "bass", "other", "vocals", "guitar", "piano"]
+
         stems = {}
-        
-        for i, name in enumerate(stem_names):
+        for i, name in enumerate(state.demucs_sources):
             stem_path = job_output_dir / f"{name}.wav"
-            # [1, 6, 2, N] -> [2, N] -> [N, 2] for soundfile
-            stem_audio = full_stems[0, i].T 
+            stem_audio = sources_np[0, i].T
+            stem_audio = np.clip(stem_audio, -1.0, 1.0)
             sf.write(str(stem_path), stem_audio, 44100)
             stems[name] = str(stem_path)
-            
-        state.jobs[job_id]["status"] = "completed"
-        state.jobs[job_id]["stems"] = stems
-        
+
+        with state.lock:
+            state.jobs[job_id]["stems"] = stems
+        return stems
+
     except Exception as e:
         import traceback
         traceback.print_exc()
-        state.jobs[job_id]["status"] = "failed"
-        state.jobs[job_id]["error"] = str(e)
+        raise e
+
+def analyze_basic_features(job_id: str, input_path: str):
+    """GPU-accelerated basic feature analysis."""
+    try:
+        with state.lock:
+            if state.jobs[job_id]["status"] == "pending":
+                 state.jobs[job_id]["status"] = "analyzing"
+
+        # 1. Load Audio to GPU
+        waveform, sr = torchaudio.load(input_path)
+        device = state.torch_device
+        waveform = waveform.to(device)
+        
+        # Convert to mono for analysis if stereo
+        if waveform.shape[0] > 1:
+            y_gpu = torch.mean(waveform, dim=0, keepdim=True)
+        else:
+            y_gpu = waveform
+            
+        # Resample to 44.1k if needed (most analysis models expect this)
+        if sr != 44100:
+            y_gpu = T.Resample(sr, 44100).to(device)(y_gpu)
+            sr = 44100
+
+        # 2. RMS (Energy) on GPU
+        # Window size 4410 (100ms)
+        frame_len = 4410
+        # Pad to ensure frames fit
+        remainder = y_gpu.shape[-1] % frame_len
+        pad_len = (frame_len - remainder) if remainder != 0 else 0
+        y_padded = torch.nn.functional.pad(y_gpu, (0, pad_len))
+        frames = y_padded.unfold(-1, frame_len, frame_len) # (1, num_frames, frame_len)
+        rms_gpu = torch.sqrt(torch.mean(frames**2, dim=-1))[0] # (num_frames)
+        
+        # 3. Chroma on GPU (using Spectrogram + Mapping)
+        # We use a 4096-bin spectrogram for better frequency resolution
+        spec_transform = T.Spectrogram(n_fft=4096, hop_length=1024, power=2).to(device)
+        spec = spec_transform(y_gpu)[0] # (freq, time)
+        
+        # Apply Chroma filters (pre-computed via librosa but applied on GPU)
+        chroma_fb = librosa.filters.chroma(sr=sr, n_fft=4096)
+        chroma_fb = torch.from_numpy(chroma_fb).to(device).float()
+        chroma_gpu = torch.matmul(chroma_fb, spec) # (12, time)
+        chroma_sum = torch.sum(chroma_gpu, dim=1) # (12)
+        
+        # 4. Key Estimation (using the GPU-computed chroma sum)
+        key_scale = estimate_key(chroma_sum)
+        
+        # 5. Chord Detection (using GPU Chroma)
+        chords = detect_chords(chroma_gpu, sr)
+        
+        # 6. Song Sections (MSAF requires file path)
+        sections = get_sections(input_path)
+        
+        # 6. BPM and Beats (CPU librosa still best for this)
+        y_cpu = y_gpu[0].cpu().numpy()
+        tempo, beats = librosa.beat.beat_track(y=y_cpu, sr=sr)
+        beat_times = librosa.frames_to_time(beats, sr=sr).tolist()
+        
+        # Format Energy Data
+        rms_np = rms_gpu.cpu().numpy()
+        times = np.arange(len(rms_np)) * (frame_len / sr)
+        energy_data = [[round(float(t), 3), round(float(r), 4)] for t, r in zip(times, rms_np)]
+        
+        results = {
+            "bpm": round(float(np.atleast_1d(tempo)[0]), 1),
+            "key": key_scale,
+            "chords": chords,
+            "beats": [round(float(b), 3) for b in beat_times],
+            "energy": energy_data,
+            "sections": sections
+        }
+        
+        with state.lock:
+            state.jobs[job_id]["analysis"].update(results)
+        return results
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise e
+
+def transcribe_vocals_task(job_id: str, vocals_path: str):
+    """GPU/ONNX task: Uses basic-pitch on active segments only."""
+    try:
+        from basic_pitch.inference import predict
+        from basic_pitch import ICASSP_2022_MODEL_PATH
+        
+        # 1. Load Vocals to GPU to find active regions
+        waveform, sr = torchaudio.load(vocals_path)
+        device = state.torch_device
+        waveform = waveform.to(device)
+        y_gpu = torch.mean(waveform, dim=0) # Mono
+        
+        # 2. Compute RMS in 100ms windows
+        frame_len = int(sr * 0.1) # 100ms
+        num_frames = y_gpu.shape[0] // frame_len
+        y_trimmed = y_gpu[:num_frames * frame_len]
+        frames = y_trimmed.view(num_frames, frame_len)
+        rms_vals = torch.sqrt(torch.mean(frames**2, dim=1))
+        
+        # 3. Identify Active Segments (RMS > 0.02)
+        is_active = (rms_vals > 0.02).cpu().numpy()
+        
+        active_segments = []
+        if np.any(is_active):
+            # Find continuous blocks of True
+            start_idx = None
+            for i, active in enumerate(is_active):
+                if active and start_idx is None:
+                    start_idx = i
+                elif not active and start_idx is not None:
+                    active_segments.append((start_idx * 0.1, i * 0.1))
+                    start_idx = None
+            if start_idx is not None:
+                active_segments.append((start_idx * 0.1, len(is_active) * 0.1))
+        
+        if not active_segments:
+            logging.info("No vocal activity detected above threshold.")
+            with state.lock:
+                state.jobs[job_id]["analysis"]["vocal_notes"] = []
+            return []
+
+        # 4. Concatenate Active Audio
+        # We add a tiny 100ms silence between segments to avoid transient artifacts
+        silence_gap = torch.zeros(int(sr * 0.1)).to(device)
+        active_chunks = []
+        mapping = [] # List of (orig_start, orig_end, concat_start)
+        current_concat_time = 0.0
+        
+        for start_t, end_t in active_segments:
+            start_sample = int(start_t * sr)
+            end_sample = int(end_t * sr)
+            chunk = y_gpu[start_sample:end_sample]
+            active_chunks.append(chunk)
+            active_chunks.append(silence_gap)
+            
+            duration = end_t - start_t
+            mapping.append({
+                "orig_start": start_t,
+                "orig_end": end_t,
+                "concat_start": current_concat_time
+            })
+            current_concat_time += duration + 0.1 # chunk + gap
+
+        full_active_audio = torch.cat(active_chunks)
+        
+        # Save temp file for basic-pitch (it needs a file path)
+        temp_vocals = Path(vocals_path).parent / f"active_vocals_{job_id}.wav"
+        torchaudio.save(str(temp_vocals), full_active_audio.cpu().unsqueeze(0), sr)
+
+        # 5. Run Basic-Pitch once
+        onnx_model = ICASSP_2022_MODEL_PATH.parent / "nmp.onnx"
+        model_path = str(onnx_model) if onnx_model.exists() else str(ICASSP_2022_MODEL_PATH)
+        
+        logging.info(f"Transcribing {len(active_segments)} active vocal segments...")
+        model_output, midi_data, note_events = predict(str(temp_vocals), model_or_model_path=model_path)
+        
+        # 6. Remap Timestamps
+        vocal_notes = []
+        for start, end, pitch, velocity, confidence in note_events:
+            # Find which original segment this note belongs to
+            orig_start = -1
+            orig_end = -1
+            
+            for m in reversed(mapping): # Check latest segments first
+                if start >= m["concat_start"]:
+                    offset = start - m["concat_start"]
+                    duration = m["orig_end"] - m["orig_start"]
+                    if offset < duration: # Note actually in this segment
+                        orig_start = m["orig_start"] + offset
+                        orig_end = orig_start + (end - start)
+                    break
+            
+            if orig_start != -1:
+                vocal_notes.append({
+                    "pitch": int(pitch),
+                    "start": round(float(orig_start), 2),
+                    "end": round(float(orig_end), 2),
+                    "conf": round(float(np.atleast_1d(confidence)[0]), 2)
+                })
+        
+        # Cleanup temp file
+        if temp_vocals.exists():
+            temp_vocals.unlink()
+            
+        with state.lock:
+            state.jobs[job_id]["analysis"]["vocal_notes"] = vocal_notes
+        return vocal_notes
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise e
+
+async def orchestrate_parallel_job(job_id: str, input_path: str):
+    """Orchestrates separation and analysis in parallel."""
+    try:
+        # Start both Separation (GPU) and Basic Analysis (CPU) simultaneously
+        # We use run_in_executor to not block the event loop
+        loop = asyncio.get_event_loop()
+        
+        # Start tasks
+        task_sep = loop.run_in_executor(None, separate_audio_task, job_id, input_path)
+        task_anal = loop.run_in_executor(None, analyze_basic_features, job_id, input_path)
+        
+        # Wait for both to finish (don't raise immediately to avoid race conditions with cleanup)
+        results = await asyncio.gather(task_sep, task_anal, return_exceptions=True)
+        
+        # Check for failures in gathered tasks
+        for res in results:
+            if isinstance(res, Exception):
+                raise res
+
+        # Now that separation is done, we have the vocals.wav
+        stems = state.jobs[job_id].get("stems", {})
+        vocals_path = stems.get("vocals")
+        
+        if vocals_path:
+            # Briefly mark as analyzing for transcription
+            with state.lock:
+                state.jobs[job_id]["status"] = "analyzing"
+            await loop.run_in_executor(None, transcribe_vocals_task, job_id, vocals_path)
+        
+        with state.lock:
+            state.jobs[job_id]["status"] = "completed"
+            
+    except Exception as e:
+        with state.lock:
+            state.jobs[job_id]["status"] = "failed"
+            state.jobs[job_id]["error"] = str(e)
+        cleanup_job(job_id)
+
+# analyze_audio_task is no longer needed, replaced by orchestrate_parallel_job
 
 # --- Endpoints ---
 
@@ -214,21 +599,23 @@ def separate_audio_task(job_id: str, input_path: str):
 
 @app.get("/system-info")
 async def system_info():
-    # Ensure model is loaded so provider reflects reality
-    if state.session is None:
-        load_session()
+    import platform
+    device = "cpu"
+    device_name = "CPU"
     
-    gpu_name = "None"
-    vram = "None"
-    
-    if state.provider == "CUDAExecutionProvider":
-        gpu_name = "NVIDIA RTX 4060"
-    
+    if torch.cuda.is_available():
+        device = "cuda"
+        device_name = torch.cuda.get_device_name(0)
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+        device_name = "Apple Silicon"
+        
     return {
-        "gpu": gpu_name,
-        "provider_active": state.provider,
-        "vram": vram,
-        "onnx_version": ort.__version__
+        "device": device,
+        "device_name": device_name,
+        "cpu_info": platform.processor(),
+        "platform": f"{platform.system()} {platform.release()}",
+        "torch_version": torch.__version__
     }
 
 @app.post("/setup/download")
@@ -254,23 +641,56 @@ async def download_progress():
 
 @app.post("/separate")
 async def separate(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(('.wav', '.mp3', '.flac')):
+        raise HTTPException(status_code=400, detail="Unsupported file format. Use WAV, MP3, or FLAC.")
+        
     job_id = str(uuid.uuid4())
     input_path = str(UPLOAD_DIR / f"{job_id}_{file.filename}")
     
-    with open(input_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    async with aiofiles.open(input_path, "wb") as buffer:
+        content = await file.read()
+        await buffer.write(content)
     
-    state.jobs[job_id] = {
-        "id": job_id,
-        "status": "queued",
-        "filename": file.filename,
-        "stems": {},
-        "error": None,
-        "timestamp": time.time()
-    }
+    with state.lock:
+        state.jobs[job_id] = {
+            "id": job_id,
+            "status": "queued",
+            "filename": file.filename,
+            "stems": {},
+            "error": None,
+            "timestamp": time.time()
+        }
     
     background_tasks.add_task(separate_audio_task, job_id, input_path)
     return {"job_id": job_id}
+
+@app.post("/analyze")
+async def analyze_audio(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(('.wav', '.mp3', '.flac')):
+        raise HTTPException(status_code=400, detail="Unsupported file format. Use WAV, MP3, or FLAC.")
+        
+    job_id = str(uuid.uuid4())
+    job_dir = OUTPUT_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    
+    input_path = job_dir / f"original_{file.filename}"
+    async with aiofiles.open(str(input_path), "wb") as f:
+        content = await file.read()
+        await f.write(content)
+        
+    with state.lock:
+        state.jobs[job_id] = {
+            "id": job_id,
+            "status": "pending",
+            "stems": {},
+            "analysis": {},
+            "created_at": time.time()
+        }
+        
+    # Launch parallel orchestrator
+    background_tasks.add_task(orchestrate_parallel_job, job_id, str(input_path))
+    
+    return {"job_id": job_id, "message": "Parallel separation and analysis started."}
 
 @app.get("/job/{job_id}/status")
 async def job_status(job_id: str):
@@ -287,7 +707,33 @@ async def get_stem(job_id: str, stem_name: str):
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="File missing")
     
-    return FileResponse(path)
+    return FileResponse(path, media_type="audio/wav")
+
+# Serve React build
+app.mount("/assets", StaticFiles(directory="frontend/dist/assets"), name="assets")
+
+@app.get("/")
+async def serve_frontend():
+    return FileResponse("frontend/dist/index.html")
+
+# Catch-all for React Router
+@app.get("/{full_path:path}")
+async def catch_all(full_path: str):
+    # Don't catch API routes
+    if full_path.startswith("api/") or full_path.startswith("job/") or full_path.startswith("setup/"):
+        raise HTTPException(status_code=404, detail="Not found")
+        
+    index = Path("frontend/dist/index.html")
+    if index.exists():
+        return FileResponse(index)
+    return {"error": "Frontend not built"}
+
+# Auto-open browser once on startup
+def open_browser():
+    time.sleep(1.5)
+    webbrowser.open("http://localhost:8000")
+
+threading.Thread(target=open_browser, daemon=True).start()
 
 if __name__ == "__main__":
     import uvicorn

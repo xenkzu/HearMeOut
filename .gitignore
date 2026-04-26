@@ -12,10 +12,12 @@ node_modules
 dist
 dist-ssr
 *.local
+.env
+.env.*
 
-# Rust
-src-tauri/target/
-src-tauri/gen/
+# Web Frontend
+frontend/dist/
+frontend/node_modules/
 
 # Python
 __pycache__/
@@ -26,10 +28,11 @@ venv/
 build/
 fastapi-backend.spec
 api.spec
+.features_msaf_tmp.json
 
-# Tauri Sidecars (Do not leak binaries)
-src-tauri/*.exe
-src-tauri/binaries/
+# Models and Checkpoints
+*.onnx
+*.th
 
 # Editor directories and files
 .vscode/*
@@ -42,10 +45,12 @@ src-tauri/binaries/
 *.sln
 *.sw?
 
-# HearMeOut
+# HearMeOut Data
 models/
 output/
 temp/
+uploads/
+HearMeOutTesting/
 *.wav
 *.mp3
 *.flac
