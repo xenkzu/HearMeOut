@@ -1,0 +1,10 @@
+onnxruntime-gpu
+fastapi
+uvicorn
+librosa
+soundfile
+pydub
+numpy
+requests
+python-multipart
+sse-starlette

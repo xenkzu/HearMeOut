@@ -41,3 +41,11 @@ src-tauri/binaries/
 *.njsproj
 *.sln
 *.sw?
+
+# HearMeOut
+models/
+output/
+temp/
+*.wav
+*.mp3
+*.flac
